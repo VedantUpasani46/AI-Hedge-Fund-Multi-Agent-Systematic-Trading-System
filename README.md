@@ -1,7 +1,7 @@
 # AI Hedge Fund — Multi-Agent Systematic Trading System
 
 **Vedant Upasani** | Quantitative Developer & Financial Engineer  
-📧 upasani99@protonmail.ch | 🔗 [LinkedIn](https://linkedin.com/in/VedantUpasani) | 🐙 [GitHub](https://github.com/VedantUpasani46)
+📧 upasani99@protonmail.ch |vedant.upasani46@outlook.com| 🔗 [LinkedIn](https://linkedin.com/in/VedantUpasani) | 🐙 [GitHub](https://github.com/VedantUpasani46)
 
 ---
 
