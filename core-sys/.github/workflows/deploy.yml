@@ -1,0 +1,352 @@
+# AI Hedge Fund — Part 9: Cloud Production
+# ==========================================
+# .github/workflows/deploy.yml — CI/CD Pipeline
+#
+# Triggers:
+#   push to main      → full pipeline (test → build → deploy to prod)
+#   push to staging   → test + build + deploy to staging
+#   pull_request      → test only (no deploy)
+#
+# Pipeline stages:
+#   1. TEST:    Run unit tests (no LLM calls, no real broker)
+#   2. LINT:    flake8, black, isort checks
+#   3. BUILD:   Docker build (verify image builds successfully)
+#   4. PUSH:    Push to ECR (only on main/staging branches)
+#   5. DEPLOY:  Update ECS service (only on main)
+#   6. VERIFY:  Health check the live deployment
+#
+# Secrets required (set in GitHub repo settings → Secrets and variables → Actions):
+#   AWS_ACCESS_KEY_ID
+#   AWS_SECRET_ACCESS_KEY
+#   AWS_ACCOUNT_ID
+#   ECR_REPOSITORY
+#   ECS_CLUSTER
+#   ECS_SERVICE
+#   API_KEYS (production API keys)
+#   ANTHROPIC_API_KEY (for integration tests, optional)
+#
+# Cost: GitHub Actions free tier = 2,000 min/month (more than enough)
+
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [main, staging]
+  pull_request:
+    branches: [main, staging]
+
+env:
+  AWS_REGION:     us-east-1
+  ECR_REPO:       ${{ secrets.ECR_REPOSITORY }}
+  ECS_CLUSTER:    ${{ secrets.ECS_CLUSTER }}
+  ECS_SERVICE:    ${{ secrets.ECS_SERVICE }}
+  PYTHON_VERSION: "3.11"
+  IMAGE_TAG:      ${{ github.sha }}
+
+jobs:
+
+  # ─── Stage 1: Tests ─────────────────────────────────────────────────────────
+  test:
+    name: Test Suite
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest pytest-asyncio pytest-cov
+
+      - name: Run unit tests
+        env:
+          # Use demo mode — no real API keys for unit tests
+          ENV:              test
+          ANTHROPIC_API_KEY: ""
+          OPENAI_API_KEY:    ""
+        run: |
+          pytest tests/ \
+            --cov=src \
+            --cov-report=xml \
+            --cov-report=term-missing \
+            -v \
+            --timeout=60 \
+            -x
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v4
+        if: always()
+        with:
+          file: coverage.xml
+          fail_ci_if_error: false
+
+  # ─── Stage 2: Lint ──────────────────────────────────────────────────────────
+  lint:
+    name: Code Quality
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install linters
+        run: pip install flake8 black isort
+
+      - name: Check formatting (black)
+        run: |
+          black --check --diff src/ tests/ || echo "::warning::Black formatting issues found"
+
+      - name: Check imports (isort)
+        run: |
+          isort --check-only --diff src/ tests/ || echo "::warning::Import ordering issues found"
+
+      - name: Lint (flake8)
+        run: |
+          flake8 src/ tests/ \
+            --max-line-length=120 \
+            --exclude=__pycache__,.git \
+            --count \
+            --statistics \
+            || echo "::warning::Flake8 issues found"
+
+  # ─── Stage 3: Docker Build ──────────────────────────────────────────────────
+  build:
+    name: Docker Build
+    runs-on: ubuntu-latest
+    needs: [test]    # Only build if tests pass
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Cache Docker layers
+        uses: actions/cache@v4
+        with:
+          path: /tmp/.buildx-cache
+          key: ${{ runner.os }}-buildx-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-buildx-
+
+      - name: Build image (verify it compiles)
+        uses: docker/build-push-action@v5
+        with:
+          context:   .
+          push:      false    # Don't push yet — just verify build
+          tags:      hedgefund-api:${{ env.IMAGE_TAG }}
+          target:    production
+          cache-from: type=local,src=/tmp/.buildx-cache
+          cache-to:   type=local,dest=/tmp/.buildx-cache-new,mode=max
+
+      # Fix cache permissions
+      - name: Move cache
+        run: |
+          rm -rf /tmp/.buildx-cache
+          mv /tmp/.buildx-cache-new /tmp/.buildx-cache
+
+      - name: Smoke test built image
+        run: |
+          docker run --rm \
+            -e ENV=test \
+            -e API_KEYS=test-key \
+            hedgefund-api:${{ env.IMAGE_TAG }} \
+            python -c "import src.api.api_server; print('Import OK')"
+
+  # ─── Stage 4: Push to ECR ───────────────────────────────────────────────────
+  push:
+    name: Push to ECR
+    runs-on: ubuntu-latest
+    needs: [build]
+    # Only push on main and staging branches (not on PRs)
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/staging')
+
+    outputs:
+      image-uri: ${{ steps.push.outputs.image-uri }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Cache Docker layers
+        uses: actions/cache@v4
+        with:
+          path: /tmp/.buildx-cache
+          key: ${{ runner.os }}-buildx-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-buildx-
+
+      - name: Build and push to ECR
+        id: push
+        uses: docker/build-push-action@v5
+        with:
+          context:   .
+          push:      true
+          target:    production
+          tags: |
+            ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPO }}:latest
+            ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPO }}:${{ env.IMAGE_TAG }}
+          cache-from: type=local,src=/tmp/.buildx-cache
+          cache-to:   type=local,dest=/tmp/.buildx-cache-new,mode=max
+          labels: |
+            git-sha=${{ github.sha }}
+            build-date=${{ github.event.head_commit.timestamp }}
+            branch=${{ github.ref_name }}
+
+      - run: |
+          echo "image-uri=${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPO }}:${{ env.IMAGE_TAG }}" \
+            >> "$GITHUB_OUTPUT"
+          mv /tmp/.buildx-cache-new /tmp/.buildx-cache
+
+  # ─── Stage 5: Deploy to Production ──────────────────────────────────────────
+  deploy-production:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: [push]
+    # Only deploy to production on main branch
+    if: github.ref == 'refs/heads/main'
+    environment: production    # Requires manual approval in GitHub settings
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - name: Deploy to ECS (rolling update)
+        run: |
+          python -c "
+          import sys
+          sys.path.insert(0, '.')
+          from src.deploy.aws_deploy import AWSConfig, ECSManager, full_deploy
+
+          cfg = AWSConfig(
+              region      = '${{ env.AWS_REGION }}',
+              account_id  = '${{ secrets.AWS_ACCOUNT_ID }}',
+              ecr_repo    = '${{ env.ECR_REPO }}',
+              ecs_cluster = '${{ env.ECS_CLUSTER }}',
+              ecs_service = '${{ env.ECS_SERVICE }}',
+          )
+          ecs = ECSManager(cfg)
+          ok = ecs.deploy('${{ needs.push.outputs.image-uri }}')
+          if not ok:
+              sys.exit(1)
+          "
+
+      - name: Wait for stable deployment
+        run: |
+          python -c "
+          import sys
+          sys.path.insert(0, '.')
+          from src.deploy.aws_deploy import AWSConfig, ECSManager
+
+          cfg = AWSConfig(
+              region      = '${{ env.AWS_REGION }}',
+              ecs_cluster = '${{ env.ECS_CLUSTER }}',
+              ecs_service = '${{ env.ECS_SERVICE }}',
+          )
+          ecs = ECSManager(cfg)
+          ok = ecs.wait_for_stable(timeout_seconds=300)
+          if not ok:
+              sys.exit(1)
+          "
+
+  # ─── Stage 6: Post-Deploy Verification ──────────────────────────────────────
+  verify:
+    name: Post-Deploy Verification
+    runs-on: ubuntu-latest
+    needs: [deploy-production]
+    if: github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Health check live API
+        env:
+          API_KEY:  ${{ secrets.API_KEYS }}
+          API_BASE: https://api.yourfund.com    # Replace with your domain
+        run: |
+          echo "Checking /health..."
+          curl -sf -H "X-API-Key: ${API_KEY}" "${API_BASE}/health" | python3 -c "
+          import json, sys
+          data = json.load(sys.stdin)
+          print(json.dumps(data, indent=2))
+          if data.get('api') != 'healthy':
+              print('HEALTH CHECK FAILED')
+              sys.exit(1)
+          print('Health check passed')
+          "
+
+      - name: Check /portfolio endpoint
+        env:
+          API_KEY:  ${{ secrets.API_KEYS }}
+          API_BASE: https://api.yourfund.com
+        run: |
+          curl -sf -H "X-API-Key: ${API_KEY}" "${API_BASE}/portfolio" | python3 -c "
+          import json, sys
+          data = json.load(sys.stdin)
+          assert 'nav' in data, 'nav missing from /portfolio response'
+          print(f'NAV: \${data[\"nav\"]:,.2f}')
+          print('Portfolio endpoint OK')
+          "
+
+      - name: Notify deployment success
+        if: success()
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          if [ -n "$SLACK_WEBHOOK_URL" ]; then
+            curl -X POST -H 'Content-type: application/json' \
+              --data "{
+                \"text\": \":white_check_mark: Deployment successful!\",
+                \"attachments\": [{
+                  \"color\": \"good\",
+                  \"fields\": [
+                    {\"title\": \"Commit\", \"value\": \"${{ github.sha }}\", \"short\": true},
+                    {\"title\": \"Branch\", \"value\": \"${{ github.ref_name }}\", \"short\": true},
+                    {\"title\": \"Author\", \"value\": \"${{ github.actor }}\", \"short\": true}
+                  ]
+                }]
+              }" \
+              "$SLACK_WEBHOOK_URL"
+          fi
+
+      - name: Notify deployment failure
+        if: failure()
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          if [ -n "$SLACK_WEBHOOK_URL" ]; then
+            curl -X POST -H 'Content-type: application/json' \
+              --data "{
+                \"text\": \":x: Deployment FAILED — ${{ github.sha }}\",
+                \"attachments\": [{\"color\": \"danger\"}]
+              }" \
+              "$SLACK_WEBHOOK_URL"
+          fi

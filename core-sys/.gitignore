@@ -1,0 +1,32 @@
+# Secrets — NEVER commit these
+.env
+*.key
+*.pem
+
+# Data and cache
+data/raw/
+data/cache/
+db/
+*.db
+*.sqlite
+
+# Logs
+logs/
+*.log
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.venv/
+venv/
+*.egg-info/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDE
+.vscode/
+.idea/
+*.swp
