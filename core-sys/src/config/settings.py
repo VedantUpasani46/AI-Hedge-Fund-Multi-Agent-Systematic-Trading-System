@@ -1,26 +1,3 @@
-"""
-AI Hedge Fund — Part 1: Foundation
-====================================
-settings.py — Central configuration & environment management
-
-Every production system needs one authoritative place for configuration.
-This module handles:
-  - Environment variable loading (.env file)
-  - API key management (LLM, data providers)
-  - System-wide constants (risk limits, universe size, etc.)
-  - Logging configuration
-  - Path management
-
-Usage:
-    from src.config.settings import cfg
-    print(cfg.ANTHROPIC_API_KEY)
-    print(cfg.MAX_POSITION_SIZE)
-
-References:
-    - 12-Factor App methodology: configuration in environment
-    - Pydantic Settings for type-safe config validation
-"""
-
 import os
 import sys
 import logging
@@ -119,8 +96,10 @@ class HedgeFundConfig:
     )
 
     # ── Default LLM Model ─────────────────────────────────────────────────────
+    # FIX: Changed from "claude-sonnet-4-6" (invalid) to the real Anthropic
+    # model identifier "claude-sonnet-4-20250514".
     DEFAULT_LLM_MODEL: str = field(
-        default_factory=lambda: os.getenv("DEFAULT_LLM_MODEL", "claude-sonnet-4-6")
+        default_factory=lambda: os.getenv("DEFAULT_LLM_MODEL", "claude-sonnet-4-20250514")
     )
     LLM_TEMPERATURE: float = field(
         default_factory=lambda: float(os.getenv("LLM_TEMPERATURE", "0.1"))
@@ -271,8 +250,8 @@ class HedgeFundConfig:
         lines = ["=== LLM Configuration ==="]
         lines.append(f"  Default model : {self.DEFAULT_LLM_MODEL}")
         lines.append(f"  Temperature   : {self.LLM_TEMPERATURE}")
-        lines.append(f"  Anthropic key : {'✓ SET' if self.has_anthropic else '✗ NOT SET'}")
-        lines.append(f"  OpenAI key    : {'✓ SET' if self.has_openai else '✗ NOT SET'}")
+        lines.append(f"  Anthropic key : {'SET' if self.has_anthropic else 'NOT SET'}")
+        lines.append(f"  OpenAI key    : {'SET' if self.has_openai else 'NOT SET'}")
         return "\n".join(lines)
 
     def portfolio_summary(self) -> str:
@@ -300,7 +279,7 @@ cfg = HedgeFundConfig()
 def setup_logging(level: str = None) -> logging.Logger:
     """Configure logging for the hedge fund system."""
     log_level = level or cfg.LOG_LEVEL
-    
+
     fmt = "%(asctime)s | %(levelname)-8s | %(name)s:%(lineno)d — %(message)s"
     date_fmt = "%Y-%m-%d %H:%M:%S"
 
@@ -349,7 +328,8 @@ MAX_POSITION_SIZE=0.15
 MAX_PORTFOLIO_VAR_PCT=0.02
 
 # ── LLM Settings ─────────────────────────────────────────────────────────────
-DEFAULT_LLM_MODEL=claude-sonnet-4-6
+# FIX: Use the real Anthropic model identifier, not "claude-sonnet-4-6"
+DEFAULT_LLM_MODEL=claude-sonnet-4-20250514
 LLM_TEMPERATURE=0.1
 AGENT_VERBOSE=true
 
